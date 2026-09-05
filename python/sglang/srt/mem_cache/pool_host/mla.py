@@ -58,6 +58,40 @@ logger = logging.getLogger(__name__)
 
 _ASCENDC_LAYER_GROUP_DEFAULT = 1
 
+# kv_exchange meta layout (int64 values), see offload_kv_exchange_copy in
+# memfabric_hybrid's acc_offload.h: 6 header values + 9 values per component.
+_KV_EXCHANGE_META_HEADER = 6
+_KV_EXCHANGE_META_STRIDE = 9
+_KV_EXCHANGE_MAX_COMPONENTS = 4
+_KV_EXCHANGE_HOST_BASE_OFFSET = 1
+
+
+def _kv_exchange_rewrite_host_base_to_dva(vals: list) -> list:
+    """Rewrite per-component host_base HVA->DVA for the AICore D2H kernel.
+
+    The AICore kernel de-references the host pool rows through device
+    mappings; conn-based DRAM pools use an independent HalHostRegister
+    dva != hva, so every host_base must be converted via offload.get_dva
+    before the meta is uploaded to the device (for vmm pools get_dva returns
+    dva == hva and this is a no-op).
+    """
+    from memfabric_hybrid import offload
+
+    num_components = int(vals[0])
+    if num_components < 0 or num_components > _KV_EXCHANGE_MAX_COMPONENTS:
+        raise ValueError(f"kv_exchange: invalid num_components {num_components} in meta")
+    for c in range(num_components):
+        idx = _KV_EXCHANGE_META_HEADER + _KV_EXCHANGE_META_STRIDE * c + _KV_EXCHANGE_HOST_BASE_OFFSET
+        host_base = int(vals[idx])
+        if host_base == 0:
+            continue
+        dva = offload.get_dva(host_base)
+        if dva == 0:
+            raise ValueError(f"kv_exchange: get_dva failed for host_base 0x{host_base:x}")
+        if dva != host_base:
+            vals[idx] = dva
+    return vals
+
 
 def _ascendc_layer_group_size() -> int:
     """Layer-group size for the AscendC sparse-copy pipeline (env-tunable)."""
@@ -422,34 +456,55 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         index_k_layer_start: int = 0,
         index_k_layer_num: int = -1,
     ) -> None:
-        """One-shot KV transfer via the Memfabric acc_offload fused AIV kernel.
+        """One-shot KV transfer via the Memfabric acc_offload fused kernel.
 
         Sends a compact metadata array (per-component layout pitches and
-        layer ranges) plus the device-resident token indices to the acc_offload
-        ``kv_exchange_copy`` kernel, which derives every (page, layer, split)
-        block address on the device: no (src, dst, len) entry table is built
-        on the host and the indices never round-trip through the CPU, so the
-        transfer launch does not synchronize the load stream.
+        layer ranges) plus the token indices to the acc_offload
+        ``kv_exchange_copy`` interface, which derives every (page, layer,
+        split) block address from the indices: no (src, dst, len) entry
+        table is built on the host, so the transfer launch does not
+        synchronize the load stream.
+
+        The implementation is selected by direction inside the interface:
+        H2D runs the host-driven AICPU path (meta and indices stay in
+        host-accessible memory, no HVA->DVA rewrite), D2H runs the AICore
+        kernel (meta and indices are device-resident, host_base is rewritten
+        to DVA before the upload).
 
         The layer range arguments restrict the transfer to one layer group
         (layer-group pipelining); the defaults transfer everything.
 
         Requires the host pool to be hybm-backed (SGLANG_HICACHE_IO_ASCENDC
-        implies SGLANG_HICACHE_HOST_MEM=hybm) since the kernel de-references
-        host pointers directly.
+        implies SGLANG_HICACHE_HOST_MEM=hybm) since the copy de-references
+        host pool rows directly.
         """
         from memfabric_hybrid import offload
 
         device = device_pool.k_buffer.device
-        # The kernel reads the token indices directly from device memory.
-        # Upload without a stream sync: a plain .to(device) from pageable
-        # memory synchronizes the stream and would serialize the pipeline.
-        if host_indices.device.type != "cpu":
-            host_indices = host_indices.cpu()
-        if device_indices.device.type != "cpu":
-            device_indices = device_indices.cpu()
-        # The kernel runs on the current (load) stream while the indices were
-        # allocated on another stream; keep them alive until the copy retires.
+        direction_value = direction.value if isinstance(direction, TransferDirection) else int(direction)
+        if direction_value == 2:
+            # D2H runs the AICore kernel, which reads the token indices and
+            # the meta directly from device memory.  Upload without a stream
+            # sync: a plain .to(device) from pageable memory synchronizes the
+            # stream and would serialize the pipeline.
+            if host_indices.device.type != "npu":
+                host_indices = to_device_no_sync(host_indices, device)
+            if device_indices.device.type != "npu":
+                device_indices = to_device_no_sync(device_indices, device)
+            # The kernel runs on the current stream while the indices were
+            # allocated on another stream; keep them alive until the copy
+            # retires.
+            stream = torch.npu.current_stream()
+            host_indices.record_stream(stream)
+            device_indices.record_stream(stream)
+        else:
+            # H2D runs the host-driven AICPU path: the native side reads the
+            # meta and the token indices directly from host memory, so both
+            # stay on the CPU (no upload, no stream interaction).
+            if host_indices.device.type != "cpu":
+                host_indices = host_indices.cpu()
+            if device_indices.device.type != "cpu":
+                device_indices = device_indices.cpu()
 
         def comp_meta(dev_t, host_t, lo, hi):
             # dev_t: (layer, page, page_size, [1,] width) layer-first;
@@ -519,7 +574,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
 
         num_pages = host_indices.numel() // self.page_size
-        direction_value = direction.value if isinstance(direction, TransferDirection) else int(direction)
         vals = [
             len(comps),
             num_pages,
@@ -530,22 +584,24 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ]
         for comp in comps:
             vals.extend(comp)
-        
 
-        # hybm_data_batch_copy executes host-side, bypassing NPU stream
-        # ordering.  For D2H (value 2 per the kv_exchange meta layout; 1 is
-        # H2D) the device KV rows may still have in-flight writes from compute
-        # streams, so drain the device first.  H2D reads only host memory,
-        # which is always coherent, and its destination rows are guarded by
-        # the complete events the caller records after this returns.
         if direction_value == 2:
-            torch.npu.synchronize()
-
-        # The meta stays on the host with plain host_base addresses: the
-        # native side resolves the hybm pool rows itself, so there is no
-        # HVA->DVA rewrite and no device upload of the meta.
-        meta = torch.tensor(vals, dtype=torch.int64)
-        ret = offload.kv_exchange_copy(meta, device)
+            # AICore path: rewrite the per-component host_base HVA->DVA
+            # (conn-based DRAM pools use an independent HalHostRegister
+            # dva != hva) and upload the meta to the device through pinned
+            # staging without a stream sync.
+            vals = _kv_exchange_rewrite_host_base_to_dva(vals)
+            pinned_meta = torch.tensor(vals, dtype=torch.int64, pin_memory=True)
+            meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
+            meta.copy_(pinned_meta, non_blocking=True)
+            track_pinned_staging(pinned_meta)
+        else:
+            # AICPU path: the meta stays on the host with plain host_base
+            # addresses; the native side resolves the hybm pool rows itself,
+            # so there is no HVA->DVA rewrite and no device upload of the
+            # meta.
+            meta = torch.tensor(vals, dtype=torch.int64)
+        ret = offload.kv_exchange_copy(meta, device, direction_value)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
 
