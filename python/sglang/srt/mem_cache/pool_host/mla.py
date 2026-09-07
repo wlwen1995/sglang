@@ -638,9 +638,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             meta = torch.tensor(vals, dtype=torch.int64)
         # The metadata retains the actual copy direction (H2D=1, D2H=2).
-        # Select the device-meta MTE entry point with 2, including first-layer
-        # H2D; select the CPU-meta AICPU entry point with 1 for later H2D.
+        # First-layer H2D uses entry point 3 with device metadata; D2H uses
+        # MTE entry point 2, and later H2D uses AICPU entry point 1.
         dispatch_mode = 2 if use_mte else 1
+        if direction_value == TransferDirection.H2D.value and layer_start == 0:
+            dispatch_mode = 3
         ret = offload.kv_exchange_copy(meta, device, dispatch_mode)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
