@@ -587,6 +587,13 @@ class HybridCacheController(BaseHiCacheController):
             # Record on the current (default) stream so load_stream can wait.
             sort_event = device_module.Event()
             sort_event.record()
+        (
+            prefetch_host_indices,
+            prefetch_device_indices,
+            prefetch_pool_transfers,
+        ) = self._prepare_prefetch_indices(
+            host_indices, device_indices, resolved_pool_transfers
+        )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -594,11 +601,11 @@ class HybridCacheController(BaseHiCacheController):
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
         self._prefetch_state = (
-            host_indices,
-            device_indices,
+            prefetch_host_indices,
+            prefetch_device_indices,
             producer_event,
             ack_finish_event,
-            resolved_pool_transfers,
+            prefetch_pool_transfers,
         )
         self._prefetch_next_layer = 1
 
@@ -657,6 +664,14 @@ class HybridCacheController(BaseHiCacheController):
                 timing_enabled=timing_enabled,
                 num_tokens_by_pool=self._num_tokens_by_pool(op),
                 num_bytes=self._transfer_num_bytes(op),
+                index_refs=(
+                    host_indices,
+                    device_indices,
+                    resolved_pool_transfers,
+                    prefetch_host_indices,
+                    prefetch_device_indices,
+                    prefetch_pool_transfers,
+                ),
             )
         )
         return producer_id

@@ -16,6 +16,7 @@ limitations under the License.
 import logging
 import threading
 import time
+from dataclasses import replace
 from functools import cache
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
@@ -189,6 +190,8 @@ class HiCacheAck(NamedTuple):
     # Total bytes moved by the op across all pools, including draft piggyback
     # and sidecar transfers that the per-pool token counts exclude.
     num_bytes: int = 0
+    # Keep CPU/NPU index tensors alive until the load finish event completes.
+    index_refs: Optional[tuple] = None
 
 
 class StorageOperation:
@@ -853,6 +856,37 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
+    def _prepare_prefetch_indices(
+        self, host_indices, device_indices, pool_transfers=None
+    ):
+        """Prepare reusable CPU indices for AICPU before entering the load stream.
+
+        The first AscendC H2D group uses NPU indices, but later groups use
+        AICPU. Converting inside a layer callback would block CPU submission
+        behind the load stream's compute dependency on every group. Call this
+        once, after sorting, and retain both representations in the load ack.
+        DCP translation remains per pool, using the same logical indices.
+        """
+        if self.io_backend != "kernel_ascend" or not ascendc_io_enabled():
+            return host_indices, device_indices, pool_transfers
+
+        def to_cpu(indices):
+            if indices is None or indices.device.type == "cpu":
+                return indices
+            return indices.cpu()
+
+        cpu_transfers = None
+        if pool_transfers is not None:
+            cpu_transfers = [
+                replace(
+                    transfer,
+                    host_indices=to_cpu(transfer.host_indices),
+                    device_indices=to_cpu(transfer.device_indices),
+                )
+                for transfer in pool_transfers
+            ]
+        return to_cpu(host_indices), to_cpu(device_indices), cpu_transfers
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
@@ -867,6 +901,9 @@ class HiCacheController:
             direction="h2d",
             layer_id=0,
         )
+        prefetch_host_indices, prefetch_device_indices, _ = (
+            self._prepare_prefetch_indices(host_indices, device_indices)
+        )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -874,8 +911,8 @@ class HiCacheController:
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
         self._prefetch_state = (
-            host_indices,
-            device_indices,
+            prefetch_host_indices,
+            prefetch_device_indices,
             producer_event,
             ack_finish_event,
         )
@@ -916,6 +953,12 @@ class HiCacheController:
                 timing_enabled=timing_enabled,
                 num_tokens_by_pool={PoolName.KV.value: len(op.device_indices)},
                 num_bytes=self._transfer_num_bytes(op),
+                index_refs=(
+                    host_indices,
+                    device_indices,
+                    prefetch_host_indices,
+                    prefetch_device_indices,
+                ),
             )
         )
         return producer_id
